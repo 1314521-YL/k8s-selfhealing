@@ -1,0 +1,5 @@
+# 真实密钥文件, 严禁提交 (含 SMTP 授权码 / API Key)
+config.env
+*.swp
+*.log
+*.db

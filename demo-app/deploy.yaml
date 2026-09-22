@@ -1,0 +1,128 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: demo-api-data
+  namespace: demo
+spec:
+  storageClassName: local-path
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-api
+  namespace: demo
+  labels: {app: demo-api}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: demo-api}}
+  template:
+    metadata:
+      labels: {app: demo-api}
+    spec:
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+      containers:
+        - name: demo-api
+          image: demo-api:1.0
+          imagePullPolicy: Never
+          ports: [{containerPort: 8080, name: http}]
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 30m, memory: 64Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: demo-api-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-api
+  namespace: demo
+  labels: {app: demo-api}
+spec:
+  type: NodePort
+  selector: {app: demo-api}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080, nodePort: 30081}
+    - {name: metrics, port: 9090, targetPort: 8080}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: demo-api
+  namespace: demo
+  labels: {app: demo-api}
+spec:
+  selector:
+    matchLabels: {app: demo-api}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+---
+# 告警规则: 演示告警 + 通用基础设施告警
+# labels 中的 namespace/kind/name/heal_strategy 供 n8n 自愈链路定位处置目标
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: selfheal-rules
+  namespace: demo
+spec:
+  groups:
+    - name: demo-app-selfheal
+      interval: 15s
+      rules:
+        - alert: DemoAppFailMode
+          expr: demo_api_fail_mode == 1
+          labels:
+            severity: critical
+            namespace: demo
+            kind: deployment
+            name: demo-api
+            heal_strategy: restart
+          annotations:
+            summary: "demo-api 处于故障注入模式(内存泄漏)"
+            description: "demo-api 实例内存持续增长并可能 OOM, 自愈链路将执行滚动重启。"
+        - alert: DemoAppPodCrashLooping
+          expr: increase(kube_pod_container_status_restarts_total{namespace="demo",pod=~"demo-api-.*"}[5m]) > 2
+          for: 30s
+          labels:
+            severity: critical
+            namespace: demo
+            kind: deployment
+            name: demo-api
+            heal_strategy: restart
+          annotations:
+            summary: "demo-api Pod 反复重启 (CrashLoop)"
+            description: "5 分钟内重启超过 2 次, 疑似 OOMKill 或启动失败, 自愈链路将执行滚动重启。"
+    - name: k8s-infra-core
+      interval: 30s
+      rules:
+        - alert: K8sNodeNotReady
+          expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            namespace: ""
+            kind: node
+            name: "{{ $labels.node }}"
+            heal_strategy: none
+          annotations:
+            summary: "节点 {{ $labels.node }} NotReady"
+            description: "节点就绪状态异常超过 2 分钟, 仅通知与 AI 诊断, 不执行自动重启。"

@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: heal-agent-data
+  namespace: monitoring
+spec:
+  storageClassName: local-path
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 100Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: heal-agent
+  namespace: monitoring
+  labels: {app: heal-agent}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: heal-agent}}
+  template:
+    metadata:
+      labels: {app: heal-agent}
+    spec:
+      serviceAccountName: heal-agent
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+      containers:
+        - name: heal-agent
+          image: heal-agent:1.2
+          imagePullPolicy: Never
+          ports: [{containerPort: 8080}]
+          envFrom:
+            - secretRef: {name: heal-agent-config}
+          env:
+            - name: HEAL_DB
+              value: /data/heal-history.db
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 20m, memory: 48Mi}
+            limits: {cpu: 300m, memory: 256Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: heal-agent-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: heal-agent
+  namespace: monitoring
+spec:
+  selector: {app: heal-agent}
+  ports: [{port: 8080, targetPort: 8080}]

@@ -1,0 +1,99 @@
+# kube-prometheus-stack 精简配置：单节点 k3s (2C/7.7G)
+fullnameOverride: kps
+
+prometheus:
+  prometheusSpec:
+    retention: 6h
+    retentionSize: 3GB
+    scrapeInterval: 30s
+    evaluationInterval: 15s
+    resources:
+      requests: {cpu: 150m, memory: 400Mi}
+      limits: {cpu: "1", memory: 1Gi}
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: ["ReadWriteOnce"]
+          resources: {requests: {storage: 5Gi}}
+    # 不强制 release 标签，便于拾取自定义 ServiceMonitor / PrometheusRule
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests: {cpu: 25m, memory: 64Mi}
+      limits: {cpu: 200m, memory: 128Mi}
+  config:
+    global:
+      resolve_timeout: 2m
+    route:
+      receiver: n8n
+      group_by: ["alertname", "namespace"]
+      group_wait: 5s
+      group_interval: 30s
+      repeat_interval: 3h
+      routes:
+        # 系统性噪音告警不进自愈链路(不发邮件): Watchdog 为保活探针,
+        # InfoInhibitor 为抑制元告警, CPUThrottlingHigh 为单节点限流噪音
+        - matchers:
+            - 'alertname =~ "Watchdog|InfoInhibitor|CPUThrottlingHigh"'
+          receiver: "null"
+    receivers:
+      - name: n8n
+        webhook_configs:
+          # 统一事件入口：n8n webhook
+          - url: http://n8n.monitoring.svc.cluster.local:5678/webhook/alertmanager
+            send_resolved: true
+      # chart 默认 Watchdog 路由的空接收器
+      - name: "null"
+
+grafana:
+  enabled: true
+  adminPassword: admin123
+  service:
+    type: NodePort
+    nodePort: 30300
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: 300m, memory: 256Mi}
+
+# 单节点 k3s 上不存在的组件：关闭抓取与告警，减少噪音
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeEtcd:
+  enabled: false
+
+coreDns:
+  enabled: true
+kubeDns:
+  enabled: false
+kubelet:
+  enabled: true
+
+kube-state-metrics:
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+    limits: {cpu: 100m, memory: 128Mi}
+
+prometheus-node-exporter:
+  resources:
+    requests: {cpu: 20m, memory: 32Mi}
+    limits: {cpu: 100m, memory: 64Mi}
+
+# 精简默认告警规则，保留核心
+defaultRules:
+  create: true
+  rules:
+    etcd: false
+    kubernetesSystem: false
+    kubeSchedulerAlerting: false
+    kubeControllerManagerAlerting: false
+    kubeProxyAlerting: false
+    cpuThrottlingHigh: false

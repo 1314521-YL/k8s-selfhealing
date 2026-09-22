@@ -1,0 +1,124 @@
+# 演示 Redis: 单实例 StatefulSet + redis-exporter 边车
+# 注意: 无持久化(纯缓存演示), 重启即清空数据 -> "重启可自愈"语义成立
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: demo
+  labels: {app: redis}
+spec:
+  serviceName: redis
+  replicas: 1
+  selector: {matchLabels: {app: redis}}
+  template:
+    metadata:
+      labels: {app: redis}
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4-alpine   # 固定版本, 避免 latest 漂移(AI 诊断建议)
+          args:
+            - redis-server
+            - --maxmemory
+            - "100mb"
+            - --maxmemory-policy
+            - allkeys-lru
+            - --enable-debug-command
+            - "yes"        # 允许 DEBUG POPULATE/SEGFAULT 用于故障注入演示
+            - --save
+            - ""           # 关闭 RDB 持久化(演示用)
+            - --appendonly
+            - "no"
+          ports: [{containerPort: 6379, name: redis}]
+          readinessProbe:
+            exec: {command: ["redis-cli", "ping"]}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 300m, memory: 256Mi}
+        - name: redis-exporter
+          image: oliver006/redis_exporter:latest
+          args: ["--redis.addr", "redis://localhost:6379"]
+          ports: [{containerPort: 9121, name: metrics}]
+          resources:
+            requests: {cpu: 10m, memory: 24Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: demo
+  labels: {app: redis}   # ServiceMonitor 靠此标签选择
+spec:
+  selector: {app: redis}
+  ports:
+    - {name: redis, port: 6379, targetPort: 6379}
+    - {name: metrics, port: 9121, targetPort: 9121}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: redis
+  namespace: demo
+  labels: {app: redis}
+spec:
+  selector:
+    matchLabels: {app: redis}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+---
+# Redis 告警规则: labels 四要素(namespace/kind/name/heal_strategy)供 n8n 自愈链路定位
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: redis-selfheal-rules
+  namespace: demo
+spec:
+  groups:
+    - name: redis-selfheal
+      interval: 15s
+      rules:
+        - alert: RedisPodCrashLooping
+          # 近5分钟重启>2 且 当前未就绪 = 正在循环崩溃
+          # 用 "and ready==0" 收尾: 一旦恢复 Ready 立即解除(避免 increase[5m] 残留导致自愈后误升级)
+          expr: increase(kube_pod_container_status_restarts_total{namespace="demo",pod=~"redis-.*",container="redis"}[5m]) > 2
+                and on(namespace,pod,container)
+                kube_pod_container_status_ready{namespace="demo",pod=~"redis-.*",container="redis"} == 0
+          for: 30s
+          labels:
+            severity: critical
+            namespace: demo
+            kind: statefulset
+            name: redis
+            heal_strategy: restart
+          annotations:
+            summary: "Redis Pod 反复重启 (CrashLoop)"
+            description: "5 分钟内 redis 容器重启超过 2 次, 自愈链路将执行滚动重启。"
+        - alert: RedisMemoryHigh
+          expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.9
+          for: 1m
+          labels:
+            severity: warning
+            namespace: demo
+            kind: statefulset
+            name: redis
+            heal_strategy: restart
+          annotations:
+            summary: "Redis 内存使用超过 maxmemory 的 90%"
+            description: "缓存类实例, 自愈滚动重启即可释放内存; 若为持久化存储实例需人工评估。"
+        - alert: RedisDown
+          expr: redis_up{namespace="demo"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            namespace: demo
+            kind: statefulset
+            name: redis
+            heal_strategy: restart
+          annotations:
+            summary: "Redis 无法连接 (redis_up=0)"
+            description: "持续 2 分钟不可达, 自愈链路将执行滚动重启; 若重启无效将自动升级人工。"

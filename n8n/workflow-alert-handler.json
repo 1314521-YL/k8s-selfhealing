@@ -1,0 +1,465 @@
+{
+  "name": "Alertmanager 自愈闭环处置",
+  "active": true,
+  "settings": { "executionOrder": "v1" },
+  "staticData": null,
+  "meta": {},
+  "pinData": {},
+  "tags": [],
+  "nodes": [
+    {
+      "id": "n1",
+      "name": "告警入口",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 300],
+      "webhookId": "alertmanager-selfheal",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "alertmanager",
+        "responseMode": "onReceived",
+        "options": {}
+      }
+    },
+    {
+      "id": "n2",
+      "name": "解析告警",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 300],
+      "parameters": {
+        "jsCode": "const payload = $input.first().json.body || $input.first().json;\nconst alerts = payload.alerts || [];\nconst out = [];\nfor (const a of alerts) {\n  const L = a.labels || {};\n  out.push({ json: {\n    route: a.status === 'resolved' ? 'resolved' : 'firing',\n    alertname: L.alertname || 'Unknown',\n    severity: L.severity || 'warning',\n    namespace: L.namespace || '',\n    kind: L.kind || '',\n    name: L.name || '',\n    heal_strategy: L.heal_strategy || 'none',\n    summary: (a.annotations && a.annotations.summary) || '',\n    description: (a.annotations && a.annotations.description) || '',\n    startsAt: a.startsAt || '',\n    fingerprint: a.fingerprint || ''\n  }});\n}\nif (!out.length) throw new Error('webhook 载荷中无告警');\nreturn out;"
+      }
+    },
+    {
+      "id": "n3",
+      "name": "分支-告警状态",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [440, 300],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 2 },
+          "conditions": [
+            {
+              "id": "c-route",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "resolved",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "n4",
+      "name": "闭环-记录恢复",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 140],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/record",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({alertname: $json.alertname, namespace: $json.namespace, target: ($json.kind ? $json.kind + '/' + $json.name : '-'), result: 'resolved', engine: '-', diagnosis: '', attempts: 0, note: 'Alertmanager 确认告警恢复, 闭环关闭'}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n5",
+      "name": "闭环-恢复邮件",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [860, 140],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/notify/email",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({subject: '[已恢复] ' + $('解析告警').item.json.alertname, body: '【闭环-恢复确认】\\n\\n告警 ' + $('解析告警').item.json.alertname + ' 已由 Alertmanager 确认恢复。\\n对象: ' + ($('解析告警').item.json.kind || '-') + '/' + ($('解析告警').item.json.name || '-') + ' @ ' + ($('解析告警').item.json.namespace || '-') + '\\n本邮件为闭环回执, 全程审计见 heal-agent /history。', priority: 'normal'}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n6",
+      "name": "邮件-告警受理",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 420],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/notify/email",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({subject: '[告警受理] ' + $json.alertname, body: '【第1步-通知】告警已受理, 自愈链路已启动\\n\\n告警: ' + $json.alertname + '\\n级别: ' + $json.severity + '\\n对象: ' + ($json.kind || '-') + '/' + ($json.name || '-') + ' @ ' + ($json.namespace || '-') + '\\n摘要: ' + $json.summary + '\\n详情: ' + $json.description + '\\n开始时间: ' + $json.startsAt, priority: ($json.severity === 'critical' ? 'high' : 'normal')}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n7",
+      "name": "分支-自愈策略",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [860, 420],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 2 },
+          "conditions": [
+            {
+              "id": "c-strategy",
+              "leftValue": "={{ $('解析告警').item.json.heal_strategy }}",
+              "rightValue": "restart",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "n8",
+      "name": "自愈-重启",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1080, 340],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/heal/restart",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({namespace: $('解析告警').item.json.namespace, kind: $('解析告警').item.json.kind, name: $('解析告警').item.json.name}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n9",
+      "name": "AI 诊断",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1300, 340],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/ai/diagnose",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({alert: $('解析告警').item.json}) }}",
+        "options": { "timeout": 90000 }
+      }
+    },
+    {
+      "id": "n10",
+      "name": "等待恢复窗口",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1520, 340],
+      "webhookId": "wait-recovery-1",
+      "parameters": { "resume": "timeInterval", "amount": 60, "unit": "seconds" }
+    },
+    {
+      "id": "n11",
+      "name": "验证恢复状态",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1740, 340],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "GET",
+        "url": "=http://heal-agent.monitoring.svc.cluster.local:8080/verify?namespace={{ encodeURIComponent($('解析告警').item.json.namespace || '') }}&kind={{ encodeURIComponent($('解析告警').item.json.kind || '') }}&name={{ encodeURIComponent($('解析告警').item.json.name || '') }}&alertname={{ encodeURIComponent($('解析告警').item.json.alertname || '') }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n12",
+      "name": "分支-已恢复",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1960, 340],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 2 },
+          "conditions": [
+            {
+              "id": "c-recovered",
+              "leftValue": "={{ $json.recovered }}",
+              "rightValue": "",
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "n25",
+      "name": "闭环-注解工作负载",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2060, 120],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/heal/annotate",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({namespace: $('解析告警').item.json.namespace, kind: $('解析告警').item.json.kind, name: $('解析告警').item.json.name, result: 'recovered', alertname: $('解析告警').item.json.alertname}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n13",
+      "name": "闭环-记录自愈成功",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2160, 220],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/record",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({alertname: $('解析告警').item.json.alertname, namespace: $('解析告警').item.json.namespace, target: $('解析告警').item.json.kind + '/' + $('解析告警').item.json.name, result: 'recovered', engine: ($('AI 诊断').item.json.engine || '-'), diagnosis: ($('AI 诊断').item.json.diagnosis || ''), attempts: 1, alert_starts_at: $('解析告警').item.json.startsAt, note: '自动滚动重启后恢复: ' + ($json.detail || '')}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n14",
+      "name": "邮件-自愈成功",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2600, 280],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/notify/email",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({subject: '[已自愈] ' + $('解析告警').item.json.alertname, body: '【闭环完成】故障已自动恢复\\n\\n告警: ' + $('解析告警').item.json.alertname + '\\n对象: ' + $('解析告警').item.json.kind + '/' + $('解析告警').item.json.name + ' @ ' + $('解析告警').item.json.namespace + '\\n处置: 自动滚动重启(尝试 ' + ($json.attempts || 1) + ' 次)\\n健康详情: ' + $('验证恢复状态').item.json.detail + '\\n全程耗时(告警起): ' + ($json.duration_seconds != null ? $json.duration_seconds + 's' : '-') + '\\n\\n---- AI 诊断(' + ($('AI 诊断').item.json.engine || '-') + ') ----\\n' + ($('AI 诊断').item.json.diagnosis || '-'), priority: 'normal'}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n15",
+      "name": "重试-再次重启",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2160, 460],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/heal/restart",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({namespace: $('解析告警').item.json.namespace, kind: $('解析告警').item.json.kind, name: $('解析告警').item.json.name}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n16",
+      "name": "等待-重试窗口",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [2380, 460],
+      "webhookId": "wait-retry-1",
+      "parameters": { "resume": "timeInterval", "amount": 60, "unit": "seconds" }
+    },
+    {
+      "id": "n17",
+      "name": "验证-重试后",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2600, 460],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "GET",
+        "url": "=http://heal-agent.monitoring.svc.cluster.local:8080/verify?namespace={{ encodeURIComponent($('解析告警').item.json.namespace || '') }}&kind={{ encodeURIComponent($('解析告警').item.json.kind || '') }}&name={{ encodeURIComponent($('解析告警').item.json.name || '') }}&alertname={{ encodeURIComponent($('解析告警').item.json.alertname || '') }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n18",
+      "name": "分支-重试后已恢复",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [2820, 460],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 2 },
+          "conditions": [
+            {
+              "id": "c-recovered2",
+              "leftValue": "={{ $json.recovered }}",
+              "rightValue": "",
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "n19",
+      "name": "闭环-记录自愈成功-重试后",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3040, 400],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/record",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({alertname: $('解析告警').item.json.alertname, namespace: $('解析告警').item.json.namespace, target: $('解析告警').item.json.kind + '/' + $('解析告警').item.json.name, result: 'recovered', engine: ($('AI 诊断').item.json.engine || '-'), diagnosis: ($('AI 诊断').item.json.diagnosis || ''), attempts: 2, alert_starts_at: $('解析告警').item.json.startsAt, note: '重试重启后恢复: ' + ($json.detail || '')}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n20",
+      "name": "升级-记录",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3040, 560],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/record",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({alertname: $('解析告警').item.json.alertname, namespace: $('解析告警').item.json.namespace, target: $('解析告警').item.json.kind + '/' + $('解析告警').item.json.name, result: 'escalated', engine: ($('AI 诊断').item.json.engine || '-'), diagnosis: ($('AI 诊断').item.json.diagnosis || ''), attempts: 2, alert_starts_at: $('解析告警').item.json.startsAt, note: '2 次自动重启后仍未恢复, 已升级人工: ' + ($json.detail || '')}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n21",
+      "name": "升级-邮件P1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3260, 560],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/notify/email",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({subject: '[P1][需人工介入] ' + $('解析告警').item.json.alertname, body: '【升级人工】自动自愈 2 次后仍未恢复, 请立即处理!\\n\\n告警: ' + $('解析告警').item.json.alertname + '\\n对象: ' + $('解析告警').item.json.kind + '/' + $('解析告警').item.json.name + ' @ ' + $('解析告警').item.json.namespace + '\\n已执行: 自动滚动重启 x2, 恢复验证未通过\\n当前状态: ' + $('验证-重试后').item.json.detail + '\\n告警开始: ' + $('解析告警').item.json.startsAt + '\\n\\n---- AI 诊断(' + ($('AI 诊断').item.json.engine || '-') + ') ----\\n' + ($('AI 诊断').item.json.diagnosis || '-') + '\\n\\n建议: kubectl -n ' + $('解析告警').item.json.namespace + ' describe/logs 排查, 并检查最近发布与配置变更。', priority: 'high'}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n22",
+      "name": "AI-仅通知诊断",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1080, 620],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/ai/diagnose",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({alert: $('解析告警').item.json}) }}",
+        "options": { "timeout": 90000 }
+      }
+    },
+    {
+      "id": "n23",
+      "name": "闭环-记录处置(无自愈)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1300, 620],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/record",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({alertname: $('解析告警').item.json.alertname, namespace: $('解析告警').item.json.namespace, target: ($('解析告警').item.json.kind || '-') + '/' + ($('解析告警').item.json.name || '-'), result: 'diagnosed', engine: ($json.engine || '-'), diagnosis: ($json.diagnosis || ''), attempts: 0, alert_starts_at: $('解析告警').item.json.startsAt, note: 'heal_strategy=none, 仅通知与诊断'}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n24",
+      "name": "邮件-处置通知",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1520, 620],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://heal-agent.monitoring.svc.cluster.local:8080/notify/email",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({subject: '[告警处置] ' + $('解析告警').item.json.alertname, body: '【通知+诊断】该告警策略为仅通知(无自动重启)\\n\\n告警: ' + $('解析告警').item.json.alertname + '\\n对象: ' + ($('解析告警').item.json.kind || '-') + '/' + ($('解析告警').item.json.name || '-') + '\\n摘要: ' + $('解析告警').item.json.summary + '\\n\\n---- AI 诊断(' + ($('AI-仅通知诊断').item.json.engine || '-') + ') ----\\n' + ($('AI-仅通知诊断').item.json.diagnosis || '-'), priority: ($('解析告警').item.json.severity === 'critical' ? 'high' : 'normal')}) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "告警入口": { "main": [[{ "node": "解析告警", "type": "main", "index": 0 }]] },
+    "解析告警": { "main": [[{ "node": "分支-告警状态", "type": "main", "index": 0 }]] },
+    "分支-告警状态": {
+      "main": [
+        [{ "node": "闭环-记录恢复", "type": "main", "index": 0 }],
+        [{ "node": "邮件-告警受理", "type": "main", "index": 0 }]
+      ]
+    },
+    "闭环-记录恢复": { "main": [[{ "node": "闭环-恢复邮件", "type": "main", "index": 0 }]] },
+    "邮件-告警受理": { "main": [[{ "node": "分支-自愈策略", "type": "main", "index": 0 }]] },
+    "分支-自愈策略": {
+      "main": [
+        [{ "node": "自愈-重启", "type": "main", "index": 0 }],
+        [{ "node": "AI-仅通知诊断", "type": "main", "index": 0 }]
+      ]
+    },
+    "自愈-重启": { "main": [[{ "node": "AI 诊断", "type": "main", "index": 0 }]] },
+    "AI 诊断": { "main": [[{ "node": "等待恢复窗口", "type": "main", "index": 0 }]] },
+    "等待恢复窗口": { "main": [[{ "node": "验证恢复状态", "type": "main", "index": 0 }]] },
+    "验证恢复状态": { "main": [[{ "node": "分支-已恢复", "type": "main", "index": 0 }]] },
+    "分支-已恢复": {
+      "main": [
+        [{ "node": "闭环-注解工作负载", "type": "main", "index": 0 }],
+        [{ "node": "重试-再次重启", "type": "main", "index": 0 }]
+      ]
+    },
+    "闭环-注解工作负载": { "main": [[{ "node": "闭环-记录自愈成功", "type": "main", "index": 0 }]] },
+    "闭环-记录自愈成功": { "main": [[{ "node": "邮件-自愈成功", "type": "main", "index": 0 }]] },
+    "重试-再次重启": { "main": [[{ "node": "等待-重试窗口", "type": "main", "index": 0 }]] },
+    "等待-重试窗口": { "main": [[{ "node": "验证-重试后", "type": "main", "index": 0 }]] },
+    "验证-重试后": { "main": [[{ "node": "分支-重试后已恢复", "type": "main", "index": 0 }]] },
+    "分支-重试后已恢复": {
+      "main": [
+        [{ "node": "闭环-记录自愈成功-重试后", "type": "main", "index": 0 }],
+        [{ "node": "升级-记录", "type": "main", "index": 0 }]
+      ]
+    },
+    "闭环-记录自愈成功-重试后": { "main": [[{ "node": "邮件-自愈成功", "type": "main", "index": 0 }]] },
+    "升级-记录": { "main": [[{ "node": "升级-邮件P1", "type": "main", "index": 0 }]] },
+    "AI-仅通知诊断": { "main": [[{ "node": "闭环-记录处置(无自愈)", "type": "main", "index": 0 }]] },
+    "闭环-记录处置(无自愈)": { "main": [[{ "node": "邮件-处置通知", "type": "main", "index": 0 }]] }
+  }
+}
